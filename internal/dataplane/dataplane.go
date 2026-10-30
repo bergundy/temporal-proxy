@@ -16,6 +16,7 @@ import (
 	"go.temporal.io/proxy/internal/auth/outbound"
 	"go.temporal.io/proxy/internal/cloud/translation"
 	"go.temporal.io/proxy/internal/config"
+	"go.temporal.io/proxy/internal/credentials"
 	"go.temporal.io/proxy/internal/metrics"
 	"go.temporal.io/proxy/internal/protoutil"
 	"go.temporal.io/proxy/internal/proxy"
@@ -24,6 +25,7 @@ import (
 	"go.temporal.io/proxy/internal/services"
 	"go.temporal.io/proxy/internal/transport/connect"
 	"go.temporal.io/proxy/internal/version"
+	pkgcredentials "go.temporal.io/proxy/pkg/credentials"
 	"go.temporal.io/proxy/pkg/crypto"
 	"go.temporal.io/proxy/pkg/logger"
 	"go.temporal.io/proxy/pkg/logger/tag"
@@ -135,6 +137,13 @@ func New(ctx context.Context, cfg *config.Config, opts ...Option) (*Dataplane, e
 		return nil, fmt.Errorf("failed to build payload codecs: %w", err)
 	}
 
+	var creds grpc.UnaryClientInterceptor
+	if cfg.Credentials != nil {
+		if creds, err = credentialsInterceptor(ctx, cfg.Credentials, o.logger); err != nil {
+			return nil, err
+		}
+	}
+
 	mux := router.MuxFor(cfg.Routing)
 
 	// A translation block nothing will consult changes nothing and would leave an
@@ -163,7 +172,7 @@ func New(ctx context.Context, cfg *config.Config, opts ...Option) (*Dataplane, e
 	for i := range cfg.Upstreams {
 		up := &cfg.Upstreams[i]
 
-		fw, ready, err := newUpstreamForwarder(cfg, o, up, codecs)
+		fw, ready, err := newUpstreamForwarder(cfg, o, up, codecs, creds)
 		if err != nil {
 			return nil, err
 		}
@@ -328,6 +337,7 @@ func newUpstreamForwarder(
 	o *options,
 	up *config.Upstream,
 	codecs *proxy.Codecs,
+	creds grpc.UnaryClientInterceptor,
 ) (*proxy.Forwarder, *connect.Conn, error) {
 	// Request-independent dial options: namespace translation and outbound
 	// credentials. Per-request credentials are added by the resolver.
@@ -374,6 +384,13 @@ func newUpstreamForwarder(
 	var codecOpts []proxy.InterceptorOption
 	if labels := cfg.Upstreams.BindingRules(up); labels.Configured() {
 		codecOpts = append(codecOpts, proxy.WithRemoteNamespace(labels.Remote))
+	}
+
+	// Credentials are sealed and opened between namespace translation and the
+	// payload codec, so their bindings name the namespace the upstream knows and
+	// digest the payloads the application sent and receives.
+	if creds != nil {
+		dialOpts = append(dialOpts, grpc.WithChainUnaryInterceptor(creds))
 	}
 
 	cdc, err := codecs.Interceptor(codecOpts...)
@@ -514,4 +531,25 @@ func cloudAPIConn(cfg *config.Config, o *options, up *config.Upstream) (*transla
 	}
 
 	return reg, conn, nil
+}
+
+// credentialsInterceptor builds the credential propagation interceptor from
+// its config: the keyset it seals and opens with, and the validators every
+// opened credential must pass.
+func credentialsInterceptor(
+	ctx context.Context,
+	cfg *config.Credentials,
+	log logger.Logger,
+) (grpc.UnaryClientInterceptor, error) {
+	keys, err := pkgcredentials.LoadKeyset(cfg.Keyset, cfg.Strict)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load credentials keyset: %w", err)
+	}
+
+	validators, err := credentials.NewValidators(ctx, cfg.Validators)
+	if err != nil {
+		return nil, err
+	}
+
+	return credentials.NewInterceptor(keys, validators, log.With(tag.Component("credentials"))).Unary(), nil
 }

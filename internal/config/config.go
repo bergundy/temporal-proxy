@@ -20,6 +20,7 @@ type (
 		APITranslations  APITranslations     `yaml:"apiTranslations"`
 		AllowedServices  Services            `yaml:"allowedServices"`
 		Auth             *AuthConfig         `yaml:"auth"`
+		Credentials      *Credentials        `yaml:"credentials"`
 		Encryption       Encryption          `yaml:"encryption"`
 		ExtensionServers ExtensionServerList `yaml:"extensionServers"`
 		Health           Health              `yaml:"health"`
@@ -130,6 +131,7 @@ func (c *Config) validate() error {
 		validation.Nested("metrics", &c.Metrics),
 		validation.Nested("routing", &c.Routing),
 		validation.WhenRules(func() bool { return c.Auth != nil }, validation.Nested("auth", c.Auth)),
+		validation.WhenRules(func() bool { return c.Credentials != nil }, validation.Nested("", c.Credentials)),
 		validation.Nested("apiTranslations", &c.APITranslations),
 		validation.Nested("upstreams", &c.Upstreams),
 	}
