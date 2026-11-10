@@ -33,11 +33,12 @@ type Upstream struct {
 
 	// mu guards the recorded state, which the serving goroutine writes while
 	// the test reads.
-	mu          sync.Mutex
-	metadata    metadata.MD
-	peers       []string
-	requests    []proto.Message
-	queryResult *common.Payloads
+	mu           sync.Mutex
+	metadata     metadata.MD
+	peers        []string
+	requests     []proto.Message
+	queryResult  *common.Payloads
+	workflowTask *workflowservice.PollWorkflowTaskQueueResponse
 }
 
 // NewUpstream starts a fake frontend on a loopback port over plaintext and
@@ -134,6 +135,40 @@ func (u *Upstream) QueryWorkflow(
 	}
 
 	return &workflowservice.QueryWorkflowResponse{QueryResult: req.GetQuery().GetQueryArgs()}, nil
+}
+
+// StartWorkflowExecution records the call and answers with a fixed run ID.
+func (u *Upstream) StartWorkflowExecution(
+	ctx context.Context, req *workflowservice.StartWorkflowExecutionRequest,
+) (*workflowservice.StartWorkflowExecutionResponse, error) {
+	u.record(ctx, req)
+
+	return &workflowservice.StartWorkflowExecutionResponse{RunId: "run-1"}, nil
+}
+
+// SetWorkflowTask sets the task PollWorkflowTaskQueue answers with.
+func (u *Upstream) SetWorkflowTask(task *workflowservice.PollWorkflowTaskQueueResponse) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.workflowTask = task
+}
+
+// PollWorkflowTaskQueue records the call and answers with the task
+// [Upstream.SetWorkflowTask] set, or an empty one.
+func (u *Upstream) PollWorkflowTaskQueue(
+	ctx context.Context, req *workflowservice.PollWorkflowTaskQueueRequest,
+) (*workflowservice.PollWorkflowTaskQueueResponse, error) {
+	u.record(ctx, req)
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if u.workflowTask == nil {
+		return &workflowservice.PollWorkflowTaskQueueResponse{}, nil
+	}
+
+	return proto.Clone(u.workflowTask).(*workflowservice.PollWorkflowTaskQueueResponse), nil
 }
 
 // Peers returns the distinct client addresses requests arrived from, in the

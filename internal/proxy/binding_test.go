@@ -436,6 +436,11 @@ func TestCrossingCoversEveryNexusField(t *testing.T) {
 		"temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest.input":             false,
 		"temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest.search_attributes": false,
 		"temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest.user_metadata":     false,
+		// Completion callbacks and their source context belong to the caller, and are
+		// delivered to a Worker in the caller's namespace.
+		"temporal.api.common.v1.Callback.NexusHandler.source_context":                                  false,
+		"temporal.api.workflowservice.v1.DescribeNexusOperationExecutionResponse.completion_callbacks": false,
+		"temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest.completion_callbacks":     false,
 	}
 
 	fields := nexusPayloadFields()

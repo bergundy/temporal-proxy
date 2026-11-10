@@ -15,7 +15,7 @@ require (
 	github.com/rs/zerolog v1.35.1
 	github.com/stretchr/testify v1.12.1
 	github.com/urfave/cli/v3 v3.14.0
-	go.temporal.io/api v1.63.5
+	go.temporal.io/api v1.64.3
 	go.temporal.io/cloud-sdk v0.21.0
 	go.uber.org/fx v1.24.0
 	gocloud.dev v0.47.0
@@ -82,6 +82,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.46.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.46.0 // indirect
 	go.opentelemetry.io/otel/trace v1.46.0 // indirect
+	go.temporal.io/sdk/contrib/credentials v0.0.0
 	go.uber.org/dig v1.19.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
@@ -97,3 +98,5 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260904194346-d0f1323225a4 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260904194346-d0f1323225a4 // indirect
 )
+
+replace go.temporal.io/sdk/contrib/credentials => /Users/bergundy/temporal/sdk-go/.claude/worktrees/indexed-growing-origami/contrib/credentials

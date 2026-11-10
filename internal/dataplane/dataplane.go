@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"slices"
 	"strings"
 	"sync"
 
+	"go.temporal.io/sdk/contrib/credentials/binding"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/reflect/protoregistry"
 
@@ -16,7 +18,6 @@ import (
 	"go.temporal.io/proxy/internal/auth/outbound"
 	"go.temporal.io/proxy/internal/cloud/translation"
 	"go.temporal.io/proxy/internal/config"
-	"go.temporal.io/proxy/internal/credentials"
 	"go.temporal.io/proxy/internal/metrics"
 	"go.temporal.io/proxy/internal/protoutil"
 	"go.temporal.io/proxy/internal/proxy"
@@ -25,7 +26,6 @@ import (
 	"go.temporal.io/proxy/internal/services"
 	"go.temporal.io/proxy/internal/transport/connect"
 	"go.temporal.io/proxy/internal/version"
-	pkgcredentials "go.temporal.io/proxy/pkg/credentials"
 	"go.temporal.io/proxy/pkg/crypto"
 	"go.temporal.io/proxy/pkg/logger"
 	"go.temporal.io/proxy/pkg/logger/tag"
@@ -139,7 +139,7 @@ func New(ctx context.Context, cfg *config.Config, opts ...Option) (*Dataplane, e
 
 	var creds grpc.UnaryClientInterceptor
 	if cfg.Credentials != nil {
-		if creds, err = credentialsInterceptor(ctx, cfg.Credentials, o.logger); err != nil {
+		if creds, err = credentialsInterceptor(cfg.Credentials, o.logger); err != nil {
 			return nil, err
 		}
 	}
@@ -191,7 +191,7 @@ func New(ctx context.Context, cfg *config.Config, opts ...Option) (*Dataplane, e
 		o.allowlist,
 	)
 
-	gateway, err := server.New(
+	gatewayOpts := []server.Option{
 		server.WithCredentials(cfg.Listen.Listener()),
 		server.WithServerCodec(router.Codec()),
 		// Health entries come from the allowlist, so what the gateway reports a
@@ -208,7 +208,14 @@ func New(ctx context.Context, cfg *config.Config, opts ...Option) (*Dataplane, e
 		server.WithStreamInterceptor(auth.StreamServerInterceptor(o.auth, o.logger)),
 		server.WithUnknownServiceHandler(handler),
 		server.WithLogger(o.logger),
-	)
+	}
+	// Applications in proxy mode send plaintext credentials only to a server that
+	// identifies itself as a credential-binding proxy.
+	if creds != nil {
+		gatewayOpts = append(gatewayOpts, server.WithStreamInterceptor(binding.StreamServerInterceptor()))
+	}
+
+	gateway, err := server.New(gatewayOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create server: %w", err)
 	}
@@ -386,19 +393,21 @@ func newUpstreamForwarder(
 		codecOpts = append(codecOpts, proxy.WithRemoteNamespace(labels.Remote))
 	}
 
-	// Credentials are sealed and opened between namespace translation and the
-	// payload codec, so their bindings name the namespace the upstream knows and
-	// digest the payloads the application sent and receives.
-	if creds != nil {
-		dialOpts = append(dialOpts, grpc.WithChainUnaryInterceptor(creds))
-	}
-
 	cdc, err := codecs.Interceptor(codecOpts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to build codec interceptor for upstream %q: %w", up.Name, err)
 	}
 
 	dialOpts = append(dialOpts, grpc.WithChainUnaryInterceptor(cdc))
+
+	// Credentials are sealed after the payload codec on the way out and opened
+	// before it on the way in, so their bindings digest the payload bytes the
+	// Temporal Service stores, as an SDK binding layer behind any codec does.
+	// They come after namespace translation, so their bindings name the
+	// namespace the upstream knows.
+	if creds != nil {
+		dialOpts = append(dialOpts, grpc.WithChainUnaryInterceptor(creds))
+	}
 
 	// Cloud does not serve every method on a frontend, so the ones it answers
 	// elsewhere are translated and sent to its control plane instead, and the ones
@@ -533,23 +542,17 @@ func cloudAPIConn(cfg *config.Config, o *options, up *config.Upstream) (*transla
 	return reg, conn, nil
 }
 
-// credentialsInterceptor builds the credential propagation interceptor from
-// its config: the keyset it seals and opens with, and the validators every
-// opened credential must pass.
-func credentialsInterceptor(
-	ctx context.Context,
-	cfg *config.Credentials,
-	log logger.Logger,
-) (grpc.UnaryClientInterceptor, error) {
-	keys, err := pkgcredentials.LoadKeyset(cfg.Keyset, cfg.Strict)
+// credentialsInterceptor builds the credential binding interceptor from its
+// config: the keyset it seals and opens with.
+func credentialsInterceptor(cfg *config.Credentials, log logger.Logger) (grpc.UnaryClientInterceptor, error) {
+	keys, err := binding.LoadKeyset(cfg.Keyset)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load credentials keyset: %w", err)
 	}
 
-	validators, err := credentials.NewValidators(ctx, cfg.Validators)
-	if err != nil {
-		return nil, err
-	}
-
-	return credentials.NewInterceptor(keys, validators, log.With(tag.Component("credentials"))).Unary(), nil
+	return binding.NewInterceptor(binding.Options{
+		Keyset: keys,
+		Strict: cfg.Strict,
+		Logger: slog.New(logger.NewSlogHandler(log.With(tag.Component("credentials")))),
+	}), nil
 }

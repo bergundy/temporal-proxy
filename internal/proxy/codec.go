@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"slices"
 
@@ -13,6 +14,7 @@ import (
 	"go.temporal.io/api/proxy"
 	"go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
+	"go.temporal.io/sdk/contrib/credentials/binding"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
@@ -284,9 +286,51 @@ func visitPayloads(
 			ns := meta.NamespaceFrom(ctx)
 			s := scope{ns: ns, label: remoteName(remote, ns), check: !crosses(ctx, payloads)}
 
-			return apply(ctx, s, opts, fn, payloads)
+			return passCredentials(payloads, func(payloads []*common.Payload) ([]*common.Payload, error) {
+				return apply(ctx, s, opts, fn, payloads)
+			})
 		},
 	}
+}
+
+// passCredentials runs fn over payloads, leaving credentials payloads where
+// they are. Those belong to the credential binding layer, which seals them
+// closer to the wire than the codec on the way out and opens them before the
+// codec on the way in.
+func passCredentials(
+	payloads []*common.Payload,
+	fn func([]*common.Payload) ([]*common.Payload, error),
+) ([]*common.Payload, error) {
+	if !slices.ContainsFunc(payloads, binding.IsCredentialsPayload) {
+		return fn(payloads)
+	}
+
+	rest := make([]*common.Payload, 0, len(payloads))
+	for _, p := range payloads {
+		if !binding.IsCredentialsPayload(p) {
+			rest = append(rest, p)
+		}
+	}
+
+	coded, err := fn(rest)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(coded) != len(rest) {
+		return nil, fmt.Errorf("proxy: payload codec returned %d payloads for %d", len(coded), len(rest))
+	}
+
+	out := make([]*common.Payload, len(payloads))
+	for i, p := range payloads {
+		if binding.IsCredentialsPayload(p) {
+			out[i] = p
+		} else {
+			out[i], coded = coded[0], coded[1:]
+		}
+	}
+
+	return out, nil
 }
 
 // remoteName maps ns through remote. An absent namespace stays absent rather
