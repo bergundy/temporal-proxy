@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	historypb "go.temporal.io/api/history/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
 	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/api/workflowservice/v1"
@@ -514,15 +515,25 @@ func pythonVenv() string {
 	return "/Users/bergundy/temporal/.worktrees/credential-propagation/sdk-python/.venv"
 }
 
-// TestPythonCoreWorker runs a Core-based Python Worker behind the proxy. Its
-// Workflow forwards the start's token to an Activity, which the proxy seals
-// from the Workflow task completion using the completion's resource_id.
-func TestPythonCoreWorker(t *testing.T) {
-	k := newKeys(t)
-	proxy := startProxy(t, k, false)
-	tq := newID("tq")
+// runPython runs python/app.py with args and returns the JSON it prints.
+func runPython(t *testing.T, args ...string) map[string]any {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, filepath.Join(pythonVenv(), "bin", "python"), append([]string{"-I", "python/app.py"}, args...)...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	require.NoError(t, err, "python/app.py %v failed:\n%s", args, stderr.String())
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(out, &got), "python/app.py %v printed %q", args, out)
+	return got
+}
 
-	cmd := exec.Command(filepath.Join(pythonVenv(), "bin", "python"), "-I", "python/worker.py", proxy, namespace, tq)
+// startPythonWorker runs a Python Worker in proxy mode on taskQueue.
+func startPythonWorker(t *testing.T, proxy, taskQueue string) {
+	t.Helper()
+	cmd := exec.Command(filepath.Join(pythonVenv(), "bin", "python"), "-I", "python/app.py", "worker", proxy, namespace, taskQueue)
 	stdout, err := cmd.StdoutPipe()
 	require.NoError(t, err)
 	var stderr strings.Builder
@@ -549,23 +560,117 @@ func TestPythonCoreWorker(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatalf("the Python Worker didn't start:\n%s", stderr.String())
 	}
+}
 
-	run, err := proxyClient(t, proxy).ExecuteWorkflow(user("eyJ-user"), startOpts(tq), "PyAgent")
-	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	var got string
-	if err := run.Get(ctx, &got); err != nil {
-		// A Worker whose completions lack resource_id never gets one through:
-		// the proxy refuses to seal, and the Workflow task times out.
-		iter := dial(t, devServer).GetWorkflowHistory(context.Background(), run.GetID(), run.GetRunID(), false, enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
-		var events []string
-		for iter.HasNext() {
-			e, err := iter.Next()
-			require.NoError(t, err)
-			events = append(events, e.GetEventType().String())
-		}
-		t.Fatalf("the Workflow didn't complete: %v; history: %v", err, events)
+// historyEvents lists the event types of a Workflow's history, read straight
+// from the Temporal Service.
+func historyEvents(t *testing.T, wfID, runID string) []*historypb.HistoryEvent {
+	t.Helper()
+	iter := dial(t, devServer).GetWorkflowHistory(context.Background(), wfID, runID, false, enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+	var events []*historypb.HistoryEvent
+	for iter.HasNext() {
+		e, err := iter.Next()
+		require.NoError(t, err)
+		events = append(events, e)
 	}
-	require.Equal(t, "eyJ-user", got)
+	return events
+}
+
+// TestPython runs Python applications built on temporalio.contrib.credentials
+// behind the proxy, next to Go applications in proxy mode. The proxy seals what
+// a Python Workflow forwards from the Workflow task completion, using the
+// completion's resource_id, which Core sends only with the local fix.
+func TestPython(t *testing.T) {
+	k := newKeys(t)
+	proxy := startProxy(t, k, false)
+	c := proxyClient(t, proxy)
+	goTQ, pyTQ := newID("tq"), newID("tq")
+	startWorker(t, c, goTQ)
+	startPythonWorker(t, proxy, pyTQ)
+	goEP, pyEP := createEndpoint(t, goTQ), createEndpoint(t, pyTQ)
+
+	get := func(t *testing.T, run client.WorkflowRun, out any) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := run.Get(ctx, out); err != nil {
+			var types []string
+			for _, e := range historyEvents(t, run.GetID(), run.GetRunID()) {
+				types = append(types, e.GetEventType().String())
+			}
+			t.Fatalf("the Workflow didn't complete: %v; history: %v", err, types)
+		}
+	}
+
+	t.Run("Python Workflow forwards to Activities, a child, and a Go Nexus handler", func(t *testing.T) {
+		run, err := c.ExecuteWorkflow(user("eyJ-user"), startOpts(pyTQ), "PyAgent", goEP)
+		require.NoError(t, err)
+		var got map[string]string
+		get(t, run, &got)
+		require.Equal(t, map[string]string{
+			"activity": "eyJ-user", "local": "eyJ-user", "child": "eyJ-user", "nexus": "eyJ-user", "outside": missing,
+		}, got)
+
+		for _, e := range historyEvents(t, run.GetID(), run.GetRunID()) {
+			if a := e.GetActivityTaskScheduledEventAttributes(); a != nil && a.GetHeader().GetFields()[binding.HeaderCredentials] != nil {
+				require.Equal(t, binding.EncodingSealed, string(a.GetHeader().GetFields()[binding.HeaderCredentials].GetMetadata()["encoding"]),
+					"the Temporal Service holds only ciphertext")
+			}
+		}
+	})
+
+	t.Run("continue-as-new", func(t *testing.T) {
+		run, err := c.ExecuteWorkflow(user("eyJ-user"), startOpts(pyTQ), "PyChain", 0)
+		require.NoError(t, err)
+		var got string
+		get(t, run, &got)
+		require.Equal(t, "eyJ-user", got)
+	})
+
+	t.Run("Go Workflow, Python Nexus handler", func(t *testing.T) {
+		run, err := c.ExecuteWorkflow(user("eyJ-user"), startOpts(goTQ), Agent, []string{pyEP})
+		require.NoError(t, err)
+		var got map[string]string
+		get(t, run, &got)
+		require.Equal(t, map[string]string{"activity": "eyJ-user", "nexus": "eyJ-user"}, got)
+	})
+
+	t.Run("Updates, Signals, and refresh", func(t *testing.T) {
+		run, err := c.ExecuteWorkflow(user(jwtFor("alice", "1")), startOpts(pyTQ), "PyApproval")
+		require.NoError(t, err)
+		update := func(ctx context.Context, name string) error {
+			h, err := c.UpdateWorkflow(ctx, client.UpdateWorkflowOptions{WorkflowID: run.GetID(), UpdateName: name, WaitForStage: client.WorkflowUpdateStageCompleted})
+			if err != nil {
+				return err
+			}
+			return h.Get(ctx, nil)
+		}
+		approver := credentials.Attach(context.Background(), credentials.Values{"approver_token": "eyJ-approver"})
+		require.True(t, isMissing(update(context.Background(), "approve")))
+		require.NoError(t, update(approver, "approve"))
+		require.True(t, isMissing(update(approver, "approve")), "if_absent keeps the first one")
+		require.True(t, isMissing(update(user(jwtFor("mallory", "1")), "refresh")))
+		fresh := jwtFor("alice", "2")
+		require.NoError(t, update(user(fresh), "refresh"))
+
+		// The first Signal doesn't carry the credential its handler requires,
+		// so it's dropped.
+		require.NoError(t, c.SignalWorkflow(context.Background(), run.GetID(), "", "keep", nil))
+		signaler := credentials.Attach(context.Background(), credentials.Values{"signal_token": "eyJ-signal"})
+		require.NoError(t, c.SignalWorkflow(signaler, run.GetID(), "", "keep", nil))
+		require.NoError(t, c.SignalWorkflow(context.Background(), run.GetID(), "", "done", nil))
+		var got map[string]string
+		get(t, run, &got)
+		require.Equal(t, map[string]string{"user_token": fresh, "approver_token": "eyJ-approver", "signal_token": "eyJ-signal"}, got)
+	})
+
+	t.Run("Python client", func(t *testing.T) {
+		got := runPython(t, "client", proxy, namespace, goTQ)
+		require.Equal(t, map[string]any{"agent": map[string]any{"activity": "eyJ-python-client"}}, got)
+	})
+
+	t.Run("Python refuses a server that isn't a credential-binding proxy", func(t *testing.T) {
+		got := runPython(t, "guard", devServer, namespace, newID("tq"))
+		require.Equal(t, map[string]any{"client": "FAILED_PRECONDITION", "worker": "refused"}, got)
+	})
 }
