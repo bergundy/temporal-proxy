@@ -99,4 +99,4 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260904194346-d0f1323225a4 // indirect
 )
 
-replace go.temporal.io/sdk/contrib/credentials => /Users/bergundy/temporal/sdk-go/.claude/worktrees/indexed-growing-origami/contrib/credentials
+replace go.temporal.io/sdk/contrib/credentials => github.com/bergundy/temporal-sdk-go/contrib/credentials v0.0.0-20261111010331-f6dab2b6d96f
