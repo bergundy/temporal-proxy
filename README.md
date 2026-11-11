@@ -89,6 +89,11 @@ reaches a different upstream with no change to the Worker.
 - **Pluggable key management.** For a backend the proxy has no built-in support for, such as an on-prem HSM or an
   internal key service, point it at an extension server you run and it wraps DEKs through that instead. Only key
   material is exchanged; payloads never reach it.
+- **Credential propagation.** Carry credentials, such as a user's token, from a Client into a Workflow and on to the
+  Activities, child Workflows, and Nexus operations that act for the user. The proxy seals what applications attach to
+  their calls to the receiver's public key, bound to the exact call, and opens it on the tasks Workers receive, so the
+  Temporal Service never sees a credential and applications hold no keys. See
+  [Credential propagation](#credential-propagation).
 - **Codec server.** Serve the `/encode`, `/decode`, and `/download` routes the Temporal CLI and Web UI use to seal and
   open payloads directly, without a Worker's data converter in the loop. A codec server holds the same KMS unwrap
   permission the proxy itself does, so one that is reachable without authentication is a decryption oracle; see
@@ -343,6 +348,137 @@ changing a translation rule would. On a deployment that already labels, switch t
 The codec server has no upstream to consult: it compares payloads with the Namespace the request names. A Web UI or CLI
 pointed at the on-premises Temporal Service names `ns1`, so under `strict` it cannot open payloads labeled `ns1.acct`
 until it is pointed at Cloud. Use `permissive` during the migration if that view needs to decode.
+
+## Credential propagation
+
+The proxy can run the credential binding layer for applications, so a credential such as a user's token travels from a
+Client into a Workflow, and from the Workflow to the Activities, child Workflows, and Nexus operations that act for the
+user, without the Temporal Service ever seeing it. Applications attach plaintext credentials to their calls. On the way
+to an upstream, the proxy seals each credentials header to the receiver's X25519 public key with HPKE, bound to the
+exact call: the Namespace, the Workflow, Update, Activity, or Nexus operation it addresses, and a digest of the call's
+payloads. On the tasks a Worker receives, it opens them and hands the Worker the result. A header moved to another
+call, or paired with other input, doesn't open.
+
+The proxy doesn't validate what it opens. Checking a token's signature, expiry, or audience is up to the application.
+
+| Key                  | Default | Meaning                                                                                   |
+| -------------------- | ------- | ----------------------------------------------------------------------------------------- |
+| `credentials.keyset` | none    | Path of the JSON keyset file to seal and open with. Required once `credentials` is set.   |
+| `credentials.strict` | `false` | Ignore the keyset's default key, so a call that selects no key fails instead of using it. |
+
+```yaml
+credentials:
+  keyset: /etc/temporal-proxy/keyset.json
+```
+
+Without a `credentials` block, the gateway doesn't advertise the feature, so applications configured for it refuse to
+send credentials through the proxy.
+
+### Keysets
+
+```json
+{
+  "keys": [
+    {"name": "agents", "id": "<10 hex digits>", "public": "<base64url X25519>", "private": "<base64url X25519>"},
+    {"name": "payments", "id": "<10 hex digits>", "public": "<base64url X25519>"}
+  ],
+  "default": "agents",
+  "nexusEndpoints": {"payments-endpoint": "payments"}
+}
+```
+
+Config and application code refer to a key by name. Only its ID travels with a sealed header, so the receiver can pick
+its private key. A key without `private` can seal but not open. For each call, the proxy seals to the first of: the key
+the application named at the call site, the key `nexusEndpoints` maps the call's Nexus endpoint to, then `default`.
+
+Generate a keyset with the proxy binary:
+
+```sh
+# One key pair per --key. The first is the default unless --default or --no-default says otherwise.
+proxy credentials generate-keyset --key agents --key payments \
+  --nexus-endpoint payments-endpoint=payments --out keyset.json
+
+# The same keyset without its private keys
+proxy credentials public-keyset keyset.json > keyset.public.json
+```
+
+`--out` creates the file with mode `0600` and refuses to overwrite one that exists; without it, the keyset goes to
+stdout. `public-keyset` is for senders that only seal, such as another proxy or an application that runs the binding
+layer itself. A proxy needs a key's private half only when Workers behind it receive calls sealed to that key.
+
+### Configuring applications
+
+Applications run the Temporal SDK's credentials plugin in proxy mode, which holds no keys. In Go, with
+`go.temporal.io/sdk/contrib/credentials`:
+
+```go
+plugin, err := credentials.NewPlugin(credentials.PluginOptions{Proxy: true})
+if err != nil {
+    return err
+}
+c, err := client.Dial(client.Options{HostPort: "localhost:7233", Plugins: []client.Plugin{plugin}})
+```
+
+In Python, with `temporalio.contrib.credentials`:
+
+```python
+client = await Client.connect("localhost:7233", plugins=[temporalio.contrib.credentials.Plugin(proxy=True)])
+```
+
+Both send plaintext credentials only to an endpoint that answers with the `credentials-binding: v1` response header,
+and refuse to send a call that carries credentials otherwise. The gateway sets that header only when `credentials` is
+configured, so pointing such an application at a proxy without it, or straight at the Temporal Service, fails closed.
+Application code attaches, forwards, and reads credentials with the plugin's API, such as `credentials.Attach`,
+`credentials.Propagate`, and `credentials.Get` in Go.
+
+### Ordering
+
+On the way out, credentials are sealed after payload encryption and Namespace translation. On the way in, they're
+opened before either is undone. A binding therefore names the Namespace as the upstream knows it (for Temporal Cloud,
+`orders.acct`) and digests the payload bytes the Temporal Service stores, as an SDK binding layer behind a payload codec
+does, so two proxies that name a Namespace differently still agree.
+
+An application that runs the binding layer itself binds the Namespace and payloads as it sends them. It interoperates
+with proxies only when the proxy it connects through, if any, neither translates its Namespace nor encrypts its
+payloads.
+
+### Core-based Workers
+
+Workers built on sdk-core (Python, TypeScript, .NET, and Ruby) must send `resource_id` (`workflow:<id>`) on Workflow
+task completions. The proxy binds the headers of the commands a Workflow task completes with, such as scheduling an
+Activity, to the Workflow ID, and a completion carries it nowhere else the proxy can read. Sending it needs an sdk-core
+change that isn't released yet. Until then, a Workflow task that forwards credentials fails, because the proxy refuses
+to seal a completion with no `resource_id`, and the task keeps retrying. Workflow tasks that forward nothing are
+unaffected, and the Go SDK already sends `resource_id`.
+
+### Trust boundary
+
+- **The link between an application and the proxy carries plaintext credentials**, in both directions. Keep it on the
+  same host, or protect it with mutual TLS on the gateway (`tls.ca`).
+- **The proxy in front of a receiving Worker sees plaintext**, since it opens credentials for that Worker. So does
+  anything that can read its memory or its keyset file.
+- **The Temporal Service sees only sealed headers.** The proxy removes any credentials field it doesn't seal, so
+  plaintext never reaches an upstream.
+
+### Operations
+
+- **Keep private keys while Workflows can still replay.** Workflow, Update, and Signal headers are opened again on
+  every replay, so a running Workflow pins its keys until it closes or continues as new. Activity and Nexus headers
+  must stay openable through retries. To rotate, add the new key to every keyset, with its private half wherever the
+  old key's is, then make it the default, and remove the old key once nothing sealed to it can still be delivered or
+  replayed.
+- **Failures name the reason and the key ID, never the value.** A header that doesn't open is logged with the reason,
+  the key ID, and the call it came on, and the Worker treats its credentials as missing. A call the proxy can't seal
+  fails with `FailedPrecondition` saying why.
+- **History read through the proxy carries opened credentials.** That includes the Temporal CLI and Web UI pointed at
+  the gateway, and `GetWorkflowExecutionHistory` from any Client. Treat that history, and anything saved from it, as a
+  secret, and limit who can read it, for example with an authorization extension server.
+- **Strict mode.** `credentials.strict` ignores `default`, so a call has to name its key or go to a Nexus endpoint
+  listed in `nexusEndpoints`; any other call that carries credentials fails. Generate a keyset for it with
+  `--no-default`.
+- **Nexus endpoint overrides.** `nexusEndpoints` maps a Nexus endpoint to the key of the Workers that handle its
+  operations, so credentials forwarded to it are sealed to that key without the calling Workflow naming one. A key
+  named at the call site still wins.
 
 ## Profiling
 

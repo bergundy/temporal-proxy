@@ -78,6 +78,15 @@ encryption:
     duration: 1h
     renewBefore: 15m
 
+# Seal the credentials applications attach to their calls, and open them on the
+# tasks Workers receive. Generate a keyset into the git-ignored dev/certs with:
+#   go run ./cmd/proxy credentials generate-keyset --key dev --out dev/certs/keyset.json
+# See "Credential propagation" in the README.
+# credentials:
+#   keyset: dev/certs/keyset.json
+#   # Ignore the keyset's default key, so every call must name one.
+#   strict: false
+
 # A loopback bind needs neither auth nor tls, which is why this is safe to
 # leave on for local development; see the README's "Codec server" section
 # before pointing one anywhere else.
