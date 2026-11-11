@@ -29,6 +29,7 @@ func main() {
 		Version: version.Version,
 		Commands: []*cli.Command{
 			serve(),
+			credentials(),
 		},
 	}
 
