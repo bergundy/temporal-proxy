@@ -426,10 +426,10 @@ client = await Client.connect("localhost:7233", plugins=[temporalio.contrib.cred
 ```
 
 Both send plaintext credentials only to an endpoint that answers with the `credentials-binding: v1` response header,
-and refuse to send a call that carries credentials otherwise. The gateway sets that header only when `credentials` is
-configured, so pointing such an application at a proxy without it, or straight at the Temporal Service, fails closed.
-Application code attaches, forwards, and reads credentials with the plugin's API, such as `credentials.Attach`,
-`credentials.Propagate`, and `credentials.Get` in Go.
+and refuse to send a call that carries credentials otherwise; a Python Worker refuses to start. The gateway sets that
+header only when `credentials` is configured, so pointing such an application at a proxy without it, or straight at the
+Temporal Service, fails closed. Application code attaches, forwards, and reads credentials with the plugin's API, such
+as `credentials.Attach`, `credentials.Propagate`, and `credentials.Get` in Go.
 
 ### Ordering
 
@@ -438,9 +438,9 @@ opened before either is undone. A binding therefore names the Namespace as the u
 `orders.acct`) and digests the payload bytes the Temporal Service stores, as an SDK binding layer behind a payload codec
 does, so two proxies that name a Namespace differently still agree.
 
-An application that runs the binding layer itself binds the Namespace and payloads as it sends them. It interoperates
-with proxies only when the proxy it connects through, if any, neither translates its Namespace nor encrypts its
-payloads.
+An application that runs the binding layer itself binds the Namespace name and payload bytes it sends and receives.
+Its calls interoperate with applications behind a proxy only where that proxy neither translates the Namespace nor
+encrypts its payloads.
 
 ### Core-based Workers
 
@@ -449,7 +449,8 @@ task completions. The proxy binds the headers of the commands a Workflow task co
 Activity, to the Workflow ID, and a completion carries it nowhere else the proxy can read. Sending it needs an sdk-core
 change that isn't released yet. Until then, a Workflow task that forwards credentials fails, because the proxy refuses
 to seal a completion with no `resource_id`, and the task keeps retrying. Workflow tasks that forward nothing are
-unaffected, and the Go SDK already sends `resource_id`.
+unaffected, and the Go SDK already sends `resource_id`. A continue-as-new command that forwards credentials must also
+name the Workflow type, which the Python plugin does: its header is bound to the type in the command.
 
 ### Trust boundary
 
