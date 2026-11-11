@@ -7,7 +7,6 @@ sends it only with the local fix.
 Usage:
     app.py worker <host:port> <namespace> <task queue>
     app.py client <host:port> <namespace> <task queue of the Go Worker>
-    app.py guard <host:port of a server that isn't a proxy> <namespace> <task queue>
 """
 
 import asyncio
@@ -23,7 +22,6 @@ from nexusrpc.handler import StartOperationContext, service_handler, sync_operat
 from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.contrib import credentials
-from temporalio.service import RPCError
 from temporalio.worker import Worker
 
 MINUTE = timedelta(minutes=1)
@@ -158,29 +156,10 @@ async def run_client(target: str, namespace: str, task_queue: str) -> None:
     print(json.dumps({"agent": agent}), flush=True)
 
 
-async def run_guard(target: str, namespace: str, task_queue: str) -> None:
-    client = await connect(target, namespace)
-    out: dict[str, str] = {}
-    try:
-        with credentials.attach(user_token="eyJ-user"):
-            await client.start_workflow(
-                "PyAgent", "", id=f"py-guard-{uuid.uuid4()}", task_queue=task_queue
-            )
-        out["client"] = "sent"
-    except RPCError as err:
-        out["client"] = err.status.name
-    try:
-        await Worker(client, task_queue=task_queue, workflows=[PyChild]).run()
-        out["worker"] = "ran"
-    except RuntimeError as err:
-        out["worker"] = "refused" if "credential-binding proxy" in str(err) else str(err)
-    print(json.dumps(out), flush=True)
-
-
 async def main() -> None:
     logging.basicConfig(level=logging.WARNING)
     mode, target, namespace, task_queue = sys.argv[1:5]
-    run = {"worker": run_worker, "client": run_client, "guard": run_guard}[mode]
+    run = {"worker": run_worker, "client": run_client}[mode]
     await run(target, namespace, task_queue)
 
 

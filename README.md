@@ -371,8 +371,8 @@ credentials:
   keyset: /etc/temporal-proxy/keyset.json
 ```
 
-Without a `credentials` block, the gateway doesn't advertise the feature, so applications configured for it refuse to
-send credentials through the proxy.
+Without a `credentials` block, the gateway doesn't advertise the feature, so Go applications configured for it refuse
+to send credentials through the proxy. Python applications can't tell, and their credentials pass through unsealed.
 
 ### Keysets
 
@@ -425,11 +425,13 @@ In Python, with `temporalio.contrib.credentials`:
 client = await Client.connect("localhost:7233", plugins=[temporalio.contrib.credentials.Plugin(proxy=True)])
 ```
 
-Both send plaintext credentials only to an endpoint that answers with the `credentials-binding: v1` response header,
-and refuse to send a call that carries credentials otherwise; a Python Worker refuses to start. The gateway sets that
-header only when `credentials` is configured, so pointing such an application at a proxy without it, or straight at the
-Temporal Service, fails closed. Application code attaches, forwards, and reads credentials with the plugin's API, such
-as `credentials.Attach`, `credentials.Propagate`, and `credentials.Get` in Go.
+A Go application sends plaintext credentials only to an endpoint that answers with the `credentials-binding: v1`
+response header, and refuses to send a call that carries credentials otherwise. The gateway sets that header only when
+`credentials` is configured, so pointing a Go application at a proxy without it, or straight at the Temporal Service,
+fails closed. A Python application can't check, because the Python SDK doesn't expose response headers: pointed at
+either, its credentials reach the Temporal Service unsealed, and are stored in history. Application code
+attaches, forwards, and reads credentials with the plugin's API, such as `credentials.Attach`, `credentials.Propagate`,
+and `credentials.Get` in Go.
 
 ### Ordering
 

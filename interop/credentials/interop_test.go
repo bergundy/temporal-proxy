@@ -668,9 +668,4 @@ func TestPython(t *testing.T) {
 		got := runPython(t, "client", proxy, namespace, goTQ)
 		require.Equal(t, map[string]any{"agent": map[string]any{"activity": "eyJ-python-client"}}, got)
 	})
-
-	t.Run("Python refuses a server that isn't a credential-binding proxy", func(t *testing.T) {
-		got := runPython(t, "guard", devServer, namespace, newID("tq"))
-		require.Equal(t, map[string]any{"client": "FAILED_PRECONDITION", "worker": "refused"}, got)
-	})
 }
